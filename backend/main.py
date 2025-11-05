@@ -1,0 +1,365 @@
+import os
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.orm import Session
+from fastapi.security import OAuth2PasswordRequestForm
+from database import get_db
+import models, schemas
+from auth import get_current_user, get_current_user_optional, authenticate_user, create_access_token
+from auth import router as auth_router
+from ai_model.extractor import FeatureExtractor
+import joblib
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
+import pandas as pd
+from bs4 import BeautifulSoup
+from fastapi.responses import JSONResponse
+
+db = next(get_db())
+models.Base.metadata.create_all(bind=db.bind)
+
+app = FastAPI()
+
+# CORS configuration for secure cookie/token usage
+default_allowed_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost",
+    "http://127.0.0.1",
+    "http://safesurf.local",
+    "https://safesurf.local",
+]
+extra_origins = os.getenv("ALLOW_ORIGINS", "")
+if extra_origins:
+    default_allowed_origins.extend(
+        origin.strip()
+        for origin in extra_origins.split(",")
+        if origin.strip()
+    )
+allowed_origins = list(dict.fromkeys(default_allowed_origins))
+
+ENV = os.getenv("ENV", "development")
+cookie_secure = os.getenv("COOKIE_SECURE", "False").lower() == "true" or ENV == "production"
+cookie_samesite = "none" if cookie_secure else "lax"
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Routers should be included after middleware
+app.include_router(auth_router)
+
+# Root endpoint to verify connection
+@app.get("/")
+def root():
+    return {"message": "SafeSurf AI backend running"}
+
+model = joblib.load("assets/rf_model_optimized.pkl")
+
+@app.post("/signup")
+def signup(request: schemas.SignupRequest, db: Session = Depends(get_db)):
+    if db.query(models.User).filter((models.User.email == request.email) |
+                                    (models.User.username == request.username)).first():
+        raise HTTPException(status_code=409, detail="이미 존재하는 사용자")
+
+    try:
+        hashed_pw = models.pwd_context.hash(request.password)
+    except ValueError as exc:
+        # bcrypt backend rejects secrets longer than 72 bytes
+        raise HTTPException(status_code=400, detail="비밀번호는 72자 이하로 입력해주세요.") from exc
+    user = models.User(email=request.email, username=request.username, password_hash=hashed_pw)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    access_token = create_access_token(data={"sub": str(user.id)})
+    response = JSONResponse(
+        content={
+            "message": "회원가입 성공",
+            "user_id": str(user.id),
+            "access_token": access_token,
+            "token_type": "bearer"
+        }
+    )
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        samesite=cookie_samesite,
+        secure=cookie_secure,
+        max_age=60 * 60,
+        path="/"
+    )
+    return response
+
+@app.post("/token")
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = (
+        db.query(models.User)
+        .filter(
+            (models.User.username == form_data.username)
+            | (models.User.email == form_data.username)
+        )
+        .first()
+    )
+
+    if not user or not models.pwd_context.verify(form_data.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 잘못되었습니다.")
+
+    token = create_access_token(data={"sub": str(user.id)})
+
+    response = JSONResponse(content={"access_token": token, "token_type": "bearer"})
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        samesite=cookie_samesite,
+        secure=cookie_secure,
+        max_age=60 * 60,  # 1 hour
+        path="/"
+    )
+    return response
+
+@app.post("/api/analyze")
+def analyze_url(request: schemas.URLAnalyzeRequest, db: Session = Depends(get_db), user: Optional[models.User] = Depends(get_current_user_optional)):
+    extractor = FeatureExtractor()
+    features = extractor.run(request.url)
+    if not features or any(f is None or f != f for f in features):
+        response_data = {
+            "url": request.url,
+            "result": "unanalyzable",
+            "prediction": None,
+            "probability": None,
+            "features": features
+        }
+        print("🚨 Response: Unanalyzable", response_data)
+        return response_data
+
+    feature_names = [
+        "IP_Address", "URL_Length", "Shortening_Service", "At_Symbol_Count", "Double_Slash_Count",
+        "Hyphen_Count", "Subdomain_Level", "SSL_Certificate", "External_Favicon", "Non_Standard_Port",
+        "HTTPS_Token", "Domain_Age", "Request_URL_Ratio", "Blacklist", "Redirects"
+    ]
+    feature_vector = [[
+        features[0],  # IP_Address
+        features[1],  # URL_Length
+        features[2],  # Shortening_Service
+        features[3],  # At_Symbol_Count
+        features[4],  # Double_Slash_Count
+        features[5],  # Hyphen_Count
+        features[6],  # Subdomain_Level
+        features[7],  # SSL_Certificate
+        features[8],  # External_Favicon
+        features[9],  # Non_Standard_Port
+        features[10], # HTTPS_Token
+        features[11], # Domain_Age
+        features[12], # Request_URL_Ratio
+        features[13], # Blacklist
+        features[14]  # Redirects
+    ]]  # 리스트로 감싸서 2D로 변환
+
+    df = pd.DataFrame(feature_vector, columns=feature_names)
+    prediction = model.predict(df)[0]
+    proba = model.predict_proba(df)[0]
+    class_index = list(model.classes_).index(prediction)
+    prob = proba[class_index]
+
+    result_map = {-1: "phishing", 0: "suspicious", 1: "legitimate"}
+    result = result_map.get(prediction, "unanalyzable")
+
+    from datetime import datetime, timezone, timedelta
+
+    if user:
+        log = models.SearchLog(
+            user_id=user.id,
+            query_url=request.url,
+            result=result,
+            searched_at=(datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S KST")
+        )
+        db.add(log)
+        db.commit()
+
+    print(f"✅ Prediction: {prediction}, Probability: {round(prob, 4)}, Result: {result}")
+
+    return {
+        "url": request.url,
+        "result": result,
+        "prediction": int(prediction),
+        "probability": round(prob, 4),
+        "features": features
+    }
+
+@app.get("/history")
+def get_history(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    logs = (
+        db.query(models.SearchLog)
+        .filter(models.SearchLog.user_id == user.id)
+        .order_by(models.SearchLog.searched_at.desc())
+        .all()
+    )
+
+    formatted_logs = []
+    for log in logs:
+        # Determine site status
+        status = "Online"
+        try:
+            import requests
+            res = requests.head(log.query_url, timeout=2)
+            if res.status_code >= 400:
+                status = "Offline"
+        except Exception:
+            status = "Offline"
+
+        # Attempt to fetch actual page title
+        title = log.query_url.split("/")[2] if "//" in log.query_url else log.query_url
+        try:
+            res = requests.get(log.query_url, timeout=3)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.text, "html.parser")
+                site_title = soup.title.string.strip() if soup.title else title
+                title = site_title
+        except Exception:
+            pass
+
+        # Tag mapping
+        tag_map = {
+            "legitimate": "Safe",
+            "suspicious": "Suspicious",
+            "phishing": "Dangerous",
+            "unanalyzable": "Unanalyzable"
+        }
+        tag = tag_map.get(log.result, "Unanalyzable")
+
+        # Color mapping
+        status_color = "green" if status == "Online" else "red"
+        tag_color = (
+            "green" if tag == "Safe"
+            else "yellow" if tag == "Suspicious"
+            else "red" if tag == "Dangerous"
+            else "gray"
+        )
+
+        formatted_logs.append({
+            "id": log.id,
+            "url": log.query_url,
+            "title": title,
+            "searched_at": log.searched_at.strftime("%Y-%m-%d %H:%M:%S") if log.searched_at else "N/A",
+            "status": status,
+            "status_color": status_color,
+            "tag": tag,
+            "tag_color": tag_color,
+        })
+
+    return formatted_logs
+
+@app.delete("/history/{log_id}")
+def delete_history(log_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    log = db.query(models.SearchLog).filter(
+        models.SearchLog.id == log_id,
+        models.SearchLog.user_id == user.id
+    ).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="Log not found")
+
+    db.delete(log)
+    db.commit()
+    return {"message": "Log deleted successfully"}
+
+
+@app.get("/auth/me")
+def read_users_me(current_user: models.User = Depends(get_current_user)):
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email
+    }
+
+# --- Helper function to generate AI reasoning ---
+def generate_reason(prediction: str, features: dict) -> str:
+    reasons = []
+    if features.get("URL_Length", 0) > 75:
+        reasons.append("URL이 비정상적으로 길고")
+    if features.get("Subdomain_Level", 0) > 3:
+        reasons.append("서브도메인 수가 많으며")
+    if not features.get("SSL_Certificate", True):
+        reasons.append("SSL 인증서가 유효하지 않습니다.")
+    if features.get("Blacklist", False):
+        reasons.append("블랙리스트에 포함되어 있습니다.")
+    if features.get("Request_URL_Ratio", 0) > 0.8:
+        reasons.append("외부 리소스 요청이 과도합니다.")
+    if features.get("Domain_Age", 12) < 6:
+        reasons.append("도메인 등록 기간이 짧습니다.")
+    if not reasons:
+        reasons.append("일부 URL 특성이 위험 패턴과 유사합니다.")
+    return f"{' '.join(reasons)} 따라서 AI는 이 URL을 {prediction}으로 분류했습니다."
+
+# --- New /inspect endpoint ---
+@app.get("/inspect")
+def inspect_url(url: str):
+    import ssl, socket, requests, json
+    from urllib.parse import urlparse
+
+    result = {"ssl": {}, "headers": {}, "geo": {}, "jarm": "N/A"}
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname or url.split("//")[-1].split("/")[0]
+
+        # SSL Info
+        try:
+            ctx = ssl.create_default_context()
+            conn = ctx.wrap_socket(socket.socket(), server_hostname=hostname)
+            conn.settimeout(3)
+            conn.connect((hostname, 443))
+            cert = conn.getpeercert()
+            result["ssl"] = {
+                "issuer": dict(x[0] for x in cert.get("issuer", [])),
+                "subject": dict(x[0] for x in cert.get("subject", [])),
+                "notBefore": cert.get("notBefore"),
+                "notAfter": cert.get("notAfter"),
+            }
+            conn.close()
+        except Exception as e:
+            result["ssl"] = {"error": str(e)}
+
+        # HTTP Headers
+        try:
+            res = requests.head(url, timeout=5, allow_redirects=True)
+            result["headers"] = dict(res.headers)
+        except Exception as e:
+            result["headers"] = {"error": str(e)}
+
+        # Geo info
+        try:
+            ip = socket.gethostbyname(hostname)
+            geo_res = requests.get(f"http://ip-api.com/json/{ip}", timeout=5)
+            result["geo"] = geo_res.json()
+        except Exception as e:
+            result["geo"] = {"error": str(e)}
+
+        # Extract features and predict for AI reasoning
+        extractor = FeatureExtractor()
+        features_list = extractor.run(url)
+        feature_names = [
+            "IP_Address", "URL_Length", "Shortening_Service", "At_Symbol_Count", "Double_Slash_Count",
+            "Hyphen_Count", "Subdomain_Level", "SSL_Certificate", "External_Favicon", "Non_Standard_Port",
+            "HTTPS_Token", "Domain_Age", "Request_URL_Ratio", "Blacklist", "Redirects"
+        ]
+        if features_list and len(features_list) == len(feature_names):
+            features_dict = dict(zip(feature_names, features_list))
+            # Predict using the model
+            import pandas as pd
+            df = pd.DataFrame([features_list], columns=feature_names)
+            prediction = model.predict(df)[0]
+            result_map = {-1: "phishing", 0: "suspicious", 1: "legitimate"}
+            result_prediction = result_map.get(prediction, "unanalyzable")
+            ai_reason = generate_reason(result_prediction, features_dict)
+        else:
+            ai_reason = "AI 분석에 필요한 URL 특성 정보를 추출할 수 없습니다."
+
+    except Exception as e:
+        return {"error": str(e)}
+
+    result["ai_reason"] = ai_reason
+    return result

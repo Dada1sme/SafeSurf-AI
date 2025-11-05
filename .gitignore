@@ -1,0 +1,50 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.log
+
+# Virtual environments
+venv/
+env/
+.venv/
+safesurf_env/
+
+# Pipenv/Poetry
+Pipfile.lock
+poetry.lock
+
+# Node.js
+node_modules/
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+
+# Build artifacts
+dist/
+build/
+frontend/build/
+
+# Environment & secrets
+.env
+*.env
+backend/.env
+frontend/.env
+
+# Docker
+*.pid
+
+# IDE/editor
+.idea/
+.vscode/
+
+# Coverage/test artifacts
+.coverage
+coverage/
+htmlcov/
+
