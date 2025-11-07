@@ -6,9 +6,28 @@ const STATUS_PRESETS = {
   error: { text: "오류", color: "#6366f1", detail: "분석 요청 중 문제가 발생했습니다." }
 };
 
-const formatProbability = (probability) => {
-  if (typeof probability !== "number") return "확률 정보 없음";
-  return `위험 확률 ${(probability * 100).toFixed(2)}%`;
+const formatProbability = (status, probability) => {
+  if (typeof probability !== "number") return "판단 확률 정보 없음";
+  const percent = (probability * 100).toFixed(2);
+  const labelMap = {
+    phishing: "위험 판단 확률",
+    suspicious: "의심 판단 확률",
+    legitimate: "안전 판단 확률"
+  };
+  const label = labelMap[status] || "판단 확률";
+  return `${label} ${percent}%`;
+};
+
+const formatUrlDisplay = (url, maxLength = 60) => {
+  if (!url) return "알 수 없는 URL";
+  let decoded;
+  try {
+    decoded = decodeURIComponent(url);
+  } catch {
+    decoded = url;
+  }
+  if (decoded.length <= maxLength) return decoded;
+  return `${decoded.slice(0, maxLength - 1)}…`;
 };
 
 const renderStatus = (container, data) => {
@@ -24,17 +43,13 @@ const renderStatus = (container, data) => {
     <div class="label" style="background:${preset.color}1a;color:${preset.color}">
       ${preset.text}
     </div>
-    <div class="url">${data.url || "알 수 없는 URL"}</div>
+    <div class="url" title="${data.url || ""}">
+      ${formatUrlDisplay(data.url)}
+    </div>
     <p class="detail">
       ${preset.detail}
       ${data.status === "error" && data.message ? `<br />${data.message}` : ""}
-      ${
-        data.status === "phishing" || data.status === "suspicious"
-          ? `<br />${formatProbability(data.probability)}`
-          : data.status === "legitimate" && typeof data.probability === "number"
-          ? `<br />${formatProbability(data.probability)}`
-          : ""
-      }
+      ${formatProbability(data.status, data.probability)}
     </p>
     <p class="detail" style="font-size:12px;color:#9ca3af;margin-top:8px;">
       마지막 분석: ${new Date(data.checkedAt).toLocaleTimeString()}
