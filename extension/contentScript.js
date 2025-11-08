@@ -23,6 +23,15 @@
     return `${(probability * 100).toFixed(2)}%`;
   };
 
+  const PROBABILITY_LABELS = {
+    phishing: "위험 확률",
+    suspicious: "의심 확률",
+    legitimate: "안전 확률"
+  };
+
+  const getProbabilityLabel = (status) =>
+    PROBABILITY_LABELS[status] || "판단 확률";
+
   const createOverlay = (payload) => {
     const { status } = payload;
     const palette = COLORS[status] || COLORS.phishing;
@@ -64,9 +73,9 @@
     detailLine.textContent =
       status === "error"
         ? payload.message || "백엔드 분석 요청에 실패했습니다."
-        : `예측 결과: ${status.toUpperCase()} · 위험 확률 ${formatProbability(
-            payload.probability
-          )}`;
+        : `예측 결과: ${status.toUpperCase()} · ${getProbabilityLabel(
+            status
+          )} ${formatProbability(payload.probability)}`;
 
     infoWrapper.appendChild(badge);
     infoWrapper.appendChild(urlLine);
