@@ -278,24 +278,80 @@ def read_users_me(current_user: models.User = Depends(get_current_user)):
 
 # --- Helper function to generate AI reasoning ---
 def generate_reason(prediction: str, features: dict) -> str:
-    reasons = []
-    if features.get("URL_Length", 0) > 75:
-        reasons.append("URL이 비정상적으로 길고")
-    if features.get("Subdomain_Level", 0) > 3:
-        reasons.append("서브도메인 수가 많으며")
-    if not features.get("SSL_Certificate", True):
-        reasons.append("SSL 인증서가 유효하지 않습니다.")
-    if features.get("Blacklist", False):
-        reasons.append("블랙리스트에 포함되어 있습니다.")
-    if features.get("Request_URL_Ratio", 0) > 0.8:
-        reasons.append("외부 리소스 요청이 과도합니다.")
-    if features.get("Domain_Age", 12) < 6:
-        reasons.append("도메인 등록 기간이 짧습니다.")
-    if not reasons:
-        reasons.append("일부 URL 특성이 위험 패턴과 유사합니다.")
-    return f"{' '.join(reasons)} 따라서 AI는 이 URL을 {prediction}으로 분류했습니다."
+    """Return human-friendly explanation aligned with the final prediction."""
+    risk_reasons = []
+    safe_reasons = []
+    localized_prediction = {
+        "legitimate": "안전",
+        "suspicious": "의심",
+        "phishing": "위험",
+    }.get(prediction, prediction)
+
+    url_length = features.get("URL_Length")
+    if isinstance(url_length, (int, float)):
+        if url_length > 75:
+            risk_reasons.append("URL이 비정상적으로 길고")
+        elif url_length <= 54:
+            safe_reasons.append("URL 길이가 정상 범위이며")
+
+    subdomains = features.get("Subdomain_Level")
+    if isinstance(subdomains, (int, float)):
+        if subdomains > 3:
+            risk_reasons.append("서브도메인 수가 과도하며")
+        elif subdomains <= 1:
+            safe_reasons.append("서브도메인 구조가 단순하고")
+
+    ssl_ok = features.get("SSL_Certificate", True)
+    if not ssl_ok:
+        risk_reasons.append("SSL 인증서가 유효하지 않습니다.")
+    elif ssl_ok:
+        safe_reasons.append("SSL 인증서가 신뢰할 수 있습니다.")
+
+    if features.get("Blacklist"):
+        risk_reasons.append("블랙리스트에 포함되어 있습니다.")
+
+    request_ratio = features.get("Request_URL_Ratio")
+    if isinstance(request_ratio, (int, float)):
+        if request_ratio > 0.8:
+            risk_reasons.append("외부 리소스 요청이 과도합니다.")
+        elif request_ratio >= 0 and request_ratio < 0.6:
+            safe_reasons.append("외부 리소스 요청 비율이 낮고")
+
+    domain_age = features.get("Domain_Age")
+    if isinstance(domain_age, (int, float)):
+        if domain_age < 6:
+            risk_reasons.append("도메인 등록 기간이 짧습니다.")
+        elif domain_age >= 12:
+            safe_reasons.append("도메인 등록 기간이 충분합니다.")
+
+    if prediction == "legitimate":
+        reasons = safe_reasons or ["주요 URL 특성이 안전 범위 내에 있습니다."]
+    else:
+        reasons = risk_reasons or ["여러 URL 지표가 위험 패턴과 유사합니다."]
+
+    return f"{' '.join(reasons)} 따라서 AI는 이 URL을 {localized_prediction}으로 분류했습니다."
 
 # --- New /inspect endpoint ---
+def _normalize_cert_names(name_entries):
+    """Convert OpenSSL name entries to dict with both long and short attribute keys."""
+    short_map = {
+        "countryName": "C",
+        "stateOrProvinceName": "ST",
+        "localityName": "L",
+        "organizationName": "O",
+        "organizationalUnitName": "OU",
+        "commonName": "CN",
+    }
+    normalized = {}
+    for rdn in name_entries or []:
+        for key, value in rdn:
+            normalized[key] = value
+            short_key = short_map.get(key)
+            if short_key:
+                normalized[short_key] = value
+    return normalized
+
+
 @app.get("/inspect")
 def inspect_url(url: str):
     import ssl, socket, requests, json
@@ -314,8 +370,8 @@ def inspect_url(url: str):
             conn.connect((hostname, 443))
             cert = conn.getpeercert()
             result["ssl"] = {
-                "issuer": dict(x[0] for x in cert.get("issuer", [])),
-                "subject": dict(x[0] for x in cert.get("subject", [])),
+                "issuer": _normalize_cert_names(cert.get("issuer")),
+                "subject": _normalize_cert_names(cert.get("subject")),
                 "notBefore": cert.get("notBefore"),
                 "notAfter": cert.get("notAfter"),
             }
