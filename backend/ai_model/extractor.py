@@ -23,21 +23,33 @@ class FeatureExtractor:
         self.domain     = None
         self.hostname   = None
         self.port       = None
+        self.scheme     = None
         self.response   = None
         self.html       = None
 
     def run(self, url: str):
-        url_parse       = urllib.parse.urlparse(url=url)
-        self.url        = url
-        self.domain     = url_parse.netloc
-        self.hostname   = url_parse.hostname
-        scheme          = url_parse.scheme
+        raw_url = url.strip()
+        parsed = urllib.parse.urlparse(raw_url)
+        candidates = [raw_url]
+        if not parsed.scheme:
+            candidates = [f"https://{raw_url}", f"http://{raw_url}"]
 
-        if not self.domain or not self.hostname or not scheme:
+        selected_parse = None
+        for candidate in candidates:
+            parsed_candidate = urllib.parse.urlparse(candidate)
+            if parsed_candidate.hostname:
+                selected_parse = parsed_candidate
+                self.url = candidate
+                break
+
+        if not selected_parse:
             print(f"Invalid URL : {url}")
             return None
 
-        self.port       = url_parse.port if url_parse.port else (443 if "https" == url_parse.scheme else 80)
+        self.domain = selected_parse.netloc
+        self.hostname = selected_parse.hostname
+        self.scheme = selected_parse.scheme
+        self.port = selected_parse.port if selected_parse.port else (443 if self.scheme == "https" else 80)
 
         # DNS resolution check before making the request
         try:
@@ -47,12 +59,26 @@ class FeatureExtractor:
             return None
 
         try:
-            self.response   = requests.get(url=url, timeout=self.timeout)
+            self.response   = requests.get(url=self.url, timeout=self.timeout)
             self.html       = self.response.text
         except Exception as e:
-            print(f"{url} Connection Error : {e}")
-            self.html = None
-            return None
+            if self.scheme == "https":
+                http_parse = selected_parse._replace(scheme="http", netloc=self.domain)
+                http_url = urllib.parse.urlunparse(http_parse)
+                try:
+                    self.scheme = "http"
+                    self.port = selected_parse.port if selected_parse.port else 80
+                    self.url = http_url
+                    self.response = requests.get(url=http_url, timeout=self.timeout)
+                    self.html = self.response.text
+                except Exception as inner_e:
+                    print(f"{url} Connection Error : {inner_e}")
+                    self.html = None
+                    return None
+            else:
+                print(f"{url} Connection Error : {e}")
+                self.html = None
+                return None
 
         return [
             self.having_ip_address(),
@@ -157,16 +183,23 @@ class FeatureExtractor:
         @param url 검사할 url
         @return 정상이면 1, 의심이면 0, 악성이면 -1
         """
+        if self.scheme != "https":
+            return 0
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
         sock.connect((self.hostname, self.port))
         context = ssl.create_default_context(cafile=certifi.where())
         try:
-            context.wrap_socket(sock, server_hostname=self.hostname)
+            wrapped = context.wrap_socket(sock, server_hostname=self.hostname)
+            wrapped.close()
             return 1
         except ssl.SSLCertVerificationError as e:
             return 0
         except ssl.SSLError:
             return -1
+        finally:
+            sock.close()
         
     def using_external_favicon(self):
         """

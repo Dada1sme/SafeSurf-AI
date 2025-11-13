@@ -10,6 +10,7 @@ from ai_model.extractor import FeatureExtractor
 import joblib
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
+from urllib.parse import urlparse, urlunparse
 import pandas as pd
 from bs4 import BeautifulSoup
 from fastapi.responses import JSONResponse
@@ -352,39 +353,88 @@ def _normalize_cert_names(name_entries):
     return normalized
 
 
+def _canonicalize_url(raw_url: str):
+    """Return a tuple of (normalized_url, ParseResult) with inferred scheme."""
+    trimmed = raw_url.strip()
+    initial = urlparse(trimmed)
+    candidates = [trimmed] if initial.scheme else [f"https://{trimmed}", f"http://{trimmed}"]
+
+    for candidate in candidates:
+        parsed = urlparse(candidate)
+        if parsed.hostname:
+            return candidate, parsed
+    raise ValueError("Invalid URL")
+
+
+def _switch_to_http(parsed):
+    """Force scheme to http while preserving other components."""
+    http_parsed = parsed._replace(scheme="http")
+    return urlunparse(http_parsed), http_parsed
+
+
 @app.get("/inspect")
 def inspect_url(url: str):
     import ssl, socket, requests, json
-    from urllib.parse import urlparse
 
     result = {"ssl": {}, "headers": {}, "geo": {}, "jarm": "N/A"}
     try:
-        parsed = urlparse(url)
-        hostname = parsed.hostname or url.split("//")[-1].split("/")[0]
+        normalized_url, parsed = _canonicalize_url(url)
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError("Invalid URL")
+        scheme = parsed.scheme or "https"
+        port = parsed.port or (443 if scheme == "https" else 80)
+        target_url = normalized_url
 
         # SSL Info
+        http_fallback_requested = False
         try:
-            ctx = ssl.create_default_context()
-            conn = ctx.wrap_socket(socket.socket(), server_hostname=hostname)
-            conn.settimeout(3)
-            conn.connect((hostname, 443))
-            cert = conn.getpeercert()
-            result["ssl"] = {
-                "issuer": _normalize_cert_names(cert.get("issuer")),
-                "subject": _normalize_cert_names(cert.get("subject")),
-                "notBefore": cert.get("notBefore"),
-                "notAfter": cert.get("notAfter"),
-            }
-            conn.close()
+            if scheme == "https" or port == 443:
+                ctx = ssl.create_default_context()
+                conn = ctx.wrap_socket(socket.socket(), server_hostname=hostname)
+                conn.settimeout(3)
+                conn.connect((hostname, port))
+                cert = conn.getpeercert()
+                result["ssl"] = {
+                    "issuer": _normalize_cert_names(cert.get("issuer")),
+                    "subject": _normalize_cert_names(cert.get("subject")),
+                    "notBefore": cert.get("notBefore"),
+                    "notAfter": cert.get("notAfter"),
+                }
+                conn.close()
+            else:
+                result["ssl"] = {"info": "HTTPS를 사용하지 않는 URL입니다."}
         except Exception as e:
             result["ssl"] = {"error": str(e)}
+            if scheme == "https":
+                http_fallback_requested = True
+
+        def maybe_switch_to_http():
+            nonlocal parsed, target_url, scheme, port, http_fallback_requested
+            if scheme != "https":
+                return
+            target_url, parsed = _switch_to_http(parsed)
+            scheme = "http"
+            port = parsed.port or 80
+            http_fallback_requested = False
+
+        if http_fallback_requested:
+            maybe_switch_to_http()
 
         # HTTP Headers
         try:
-            res = requests.head(url, timeout=5, allow_redirects=True)
+            res = requests.head(target_url, timeout=5, allow_redirects=True)
             result["headers"] = dict(res.headers)
         except Exception as e:
-            result["headers"] = {"error": str(e)}
+            if scheme == "https":
+                maybe_switch_to_http()
+                try:
+                    res = requests.head(target_url, timeout=5, allow_redirects=True)
+                    result["headers"] = dict(res.headers)
+                except Exception as inner_e:
+                    result["headers"] = {"error": str(inner_e)}
+            else:
+                result["headers"] = {"error": str(e)}
 
         # Geo info
         try:
